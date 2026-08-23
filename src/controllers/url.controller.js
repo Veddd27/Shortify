@@ -1,7 +1,7 @@
 import pool from "../config/db.js";
 import { encode } from "../utils/base62.js";
-import { parseUserAgent } from "../utils/userAgent.js";
 import { getCachedUrl, setCachedUrl, invalidateCachedUrl } from "../utils/urlCache.js";
+import { clickQueue } from "../queues/clickQueue.js";
 
 export async function createUrl(req, res) {
     // validate(createUrlSchema) already confirmed originalUrl is a valid
@@ -195,39 +195,26 @@ export async function redirectToOriginal(req, res) {
         return res.status(410).json({ error: "This short URL has expired" });
     }
 
-    // Recording the click happens INSIDE this request, before we redirect —
-    // the response doesn't go out until this INSERT finishes. That's
-    // deliberate, not an oversight: this gives us an honest "before"
-    // measurement of what analytics-on-the-hot-path actually costs, which
-    // is exactly what Stage 4 (Performance) exists to go measure for real.
-    // Stage 5 (caching) and Stage 10 (async processing) are the ones that
-    // will actually fix this — we want to feel the problem first.
-    //
-    // DISABLE_CLICK_TRACKING is a deliberate feature flag, not a hack —
-    // it exists specifically so we can run the exact same k6 load test
-    // twice, once with this INSERT happening and once without, and isolate
-    // its cost as a real measured number instead of a guess.
+    // Stage 3 did this INSERT directly, inline, right here — Stage 4
+    // measured that costing ~64.6% extra p95 latency on the redirect.
+    // Stage 10 is the fix: instead of writing to Postgres ourselves, we
+    // hand off a small description of "what happened" to a queue (a fast
+    // write to Redis, not Postgres) and immediately move on to the
+    // redirect. A completely separate process (src/worker.js) picks that
+    // job up whenever it gets to it — parsing the user agent and doing
+    // the actual INSERT happen there, off this request entirely.
     if (process.env.DISABLE_CLICK_TRACKING !== "true") {
-        const { browser, os, deviceType } = parseUserAgent(req.headers["user-agent"]);
         try {
-            await pool.query(
-                `INSERT INTO clicks (url_id, referrer, user_agent, browser, os, device_type, ip_address)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-                [
-                    url.id,
-                    req.headers.referer || null,
-                    req.headers["user-agent"] || null,
-                    browser,
-                    os,
-                    deviceType,
-                    req.ip,
-                ]
-            );
+            await clickQueue.add("record-click", {
+                urlId: url.id,
+                referrer: req.headers.referer || null,
+                userAgent: req.headers["user-agent"] || null,
+                ip: req.ip,
+            });
         } catch (err) {
-            // A failure to record a click should never break the actual
-            // redirect for the person clicking the link — log it and move
-            // on rather than letting this throw and 500 the request.
-            console.error("Failed to record click:", err);
+            // Same reasoning as before: a failure to record a click should
+            // never break the redirect for the person clicking the link.
+            console.error("Failed to enqueue click:", err.message);
         }
     }
 

@@ -132,3 +132,41 @@ k6 run -e SHORT_CODE=<code> load-test/redirect-test.js
 # Part 2 (finding the ceiling): set DISABLE_RATE_LIMIT=true in .env, restart the server, then:
 k6 run -e SHORT_CODE=<code> load-test/stress-test.js
 ```
+
+---
+
+# Stage 10 — Async Processing
+
+**Date:** 2026-08-24
+**What was built:** Click tracking moved off the redirect's critical path entirely. Instead of `redirectToOriginal` writing directly to Postgres (Stage 3/4's approach), it now enqueues a small job onto a Redis-backed queue (BullMQ) and immediately redirects. A completely separate OS process (`src/worker.js`, run alongside the main server) picks jobs off that queue, parses the user agent, and does the actual `INSERT` — both pieces of work Stage 7 specifically identified as real cost on the request path.
+
+## The measurement (rate limiting disabled for this run, same reasoning as Stage 7 — one k6 process shares one IP)
+
+| | Stage 4: synchronous INSERT (baseline) | Stage 10: async via queue | Stage 4: tracking off entirely (theoretical floor) |
+|---|---|---|---|
+| p95 latency | 5.76 ms | **3.72 ms** | 2.04 ms |
+| avg latency | 2.57 ms | **2.04 ms** | 0.85 ms |
+| Error rate | 0% | 0% | 0% |
+
+Async processing recovered **35.4% of the p95 latency cost** and **20.6% of the average latency cost** that synchronous click tracking introduced — real, measured, using the identical k6 script and VU ramp as Stage 4. It doesn't fully close the gap down to the "tracking off" floor, and that's expected: the redirect handler still does one Redis round trip to enqueue the job (`clickQueue.add(...)`), which is real but far cheaper than a Postgres `INSERT` with a foreign-key check. The ~1.68ms remaining gap between async and "fully off" is roughly the cost of that one Redis write.
+
+## A real discrepancy investigated, not glossed over
+
+Immediately after the load test, the analytics endpoint reported `totalClicks: 58529` — short of the `59,900` requests k6 actually sent. Rather than round it off as "close enough," this was checked directly:
+- `LLEN bull:click-tracking:wait` → `0` — no jobs stuck pending.
+- No entries in either the "failed to enqueue" log or the worker's "failed" event log.
+- A raw `SELECT COUNT(*) FROM clicks` moments later → **59,901** — exactly right (59,900 + 1 warm-up request).
+
+Conclusion: no data was lost. The first check simply caught the worker mid-drain — it processes one job at a time by default, so a sudden burst of ~750 clicks/sec takes a few seconds *after* the burst ends to fully catch up. That's the queue doing exactly its job: absorbing a spike and processing it at a sustainable rate, rather than either dropping data or blocking the redirects that generated it. Worth knowing as a real property of this design: analytics numbers are *eventually* consistent, not instantaneous, by design.
+
+## Reproducing this
+
+```bash
+# Two processes now, not one:
+npm run start    # the API server
+npm run worker   # the click-tracking worker, in a separate terminal
+
+# Then, same as Stage 4/7:
+node load-test/setup.js
+k6 run -e SHORT_CODE=<code> load-test/redirect-test.js
+```
