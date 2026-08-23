@@ -3,6 +3,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { validate } from "../middleware/validate.js";
 import { createUrlSchema, updateUrlSchema } from "../validators/url.schemas.js";
 import { createUrl, listUrls, updateUrl, deleteUrl } from "../controllers/url.controller.js";
+import { getUrlAnalytics } from "../controllers/analytics.controller.js";
 
 const router = express.Router();
 
@@ -13,6 +14,7 @@ router.use(requireAuth);
 
 router.post("/", validate(createUrlSchema), createUrl);
 router.get("/", listUrls);
+router.get("/:id/analytics", getUrlAnalytics);
 router.patch("/:id", validate(updateUrlSchema), updateUrl);
 router.delete("/:id", deleteUrl);
 
