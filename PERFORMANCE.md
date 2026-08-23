@@ -47,3 +47,40 @@ k6 run -e SHORT_CODE=<code from setup output> load-test/redirect-test.js
 ```
 
 To compare with tracking disabled, set `DISABLE_CLICK_TRACKING=true` in `.env`, restart the server, and re-run the same k6 command against the same short code.
+
+---
+
+# Stage 5 — Caching
+
+**Date:** 2026-08-23
+**What was built:** Redis cache-aside caching for the redirect lookup (`GET /:shortCode`), using `ioredis`. `updateUrl`/`deleteUrl` actively invalidate the relevant cache entry the moment the row changes (not relying on TTL alone — a disabled/updated url must stop resolving immediately, not up to 5 minutes later). A 5-minute TTL exists only as a safety net. Redis runs locally via Docker (`redis:7-alpine`).
+
+## A real bug found and fixed along the way
+
+The first version of the "graceful fallback if Redis is down" logic wasn't actually graceful — measured live, a redirect took **16.6 seconds** to respond while Redis was stopped, because `ioredis` by default queues commands and waits for a reconnect attempt before giving up, rather than failing fast. Adding `enableOfflineQueue: false` (see [config/redis.js](src/config/redis.js)) fixed this to a consistent **~100ms** fallback to Postgres — verified by stopping the Redis container mid-test and timing real requests before and after the fix.
+
+## The performance result — genuinely surprising, reported honestly
+
+| | Stage 4 baseline (no cache) | Stage 5 (cached) |
+|---|---|---|
+| p95, click tracking OFF | 2.04 ms | 11.51 ms (repeated: 11.14 ms) |
+| p95, click tracking ON | 5.76 ms | 52.5 ms |
+| Error rate | 0% | 0% |
+
+**Caching made the redirect measurably slower, not faster**, at 200 concurrent VUs. This was not expected, and rather than write around it, here's the actual investigation:
+
+- **Isolated, low-concurrency check** (100 sequential calls, no load): Redis `GET` (avg 0.76ms) and the Postgres `SELECT` it replaces (avg 1.5ms) are comparable — Redis if anything slightly faster. So the slowdown isn't "Redis is inherently slow."
+- **Redis container CPU usage during the k6 run**: measured at just **10%** via `docker stats` — Redis itself is nowhere near its own capacity limit.
+- **Conclusion**: the added latency is very likely coming from the network path, not Redis or the caching logic — Docker Desktop on Windows has no host-networking mode, so every request to the containerized Redis is routed through a virtualized NAT layer (WSL2). That overhead doesn't show up in a low-frequency sequential probe, but becomes a real bottleneck under genuine concurrent load.
+
+**This is treated as a local-environment artifact, not a verdict on caching itself.** An attempt was made to remove Docker's networking layer from the equation entirely by installing Redis natively on Windows (Memurai) — the installer required admin elevation that wasn't completed in this session, so this remains an open, flagged question rather than a proven root cause. The cache-aside logic, invalidation, and graceful-degradation behavior are all correct and verified independently of this result (see below). The real, representative measurement will come once this runs against AWS ElastiCache in the same VPC as the app (Stage 8/9) — same-network, purpose-built, no consumer-OS virtualization layer involved — and this section will be revisited then.
+
+## What was verified correct (independent of the performance surprise)
+
+- Cache populated on first (miss) request, hit on subsequent requests — confirmed via `redis-cli GET` showing the cached row and a live TTL.
+- `PATCH` (disable, change destination, set/clear expiration) and `DELETE` both invalidate the cache entry immediately — confirmed a disabled url returns `410` on the very next request, not a stale cached `302`, and confirmed the "disabled" answer itself then gets correctly cached.
+- Redis outage: app falls back to Postgres and keeps serving correct redirects with 0 errors; recovers and resumes caching automatically once Redis comes back, with no app restart needed.
+
+## Open item
+
+Revisit this comparison once deployed to AWS with ElastiCache, and/or complete the native Redis (Memurai) install locally to isolate whether Docker Desktop's networking is really the cause.

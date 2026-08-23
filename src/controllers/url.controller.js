@@ -1,6 +1,7 @@
 import pool from "../config/db.js";
 import { encode } from "../utils/base62.js";
 import { parseUserAgent } from "../utils/userAgent.js";
+import { getCachedUrl, setCachedUrl, invalidateCachedUrl } from "../utils/urlCache.js";
 
 export async function createUrl(req, res) {
     // validate(createUrlSchema) already confirmed originalUrl is a valid
@@ -106,6 +107,16 @@ export async function updateUrl(req, res) {
     }
 
     const url = result.rows[0];
+
+    // Actively invalidate the cache entry the moment the underlying row
+    // changes — this is what actually keeps the cache correct, not the
+    // TTL. Without this, a disabled/redirected-elsewhere url could keep
+    // serving its OLD cached answer for up to TTL_SECONDS after being
+    // changed, which is a real correctness bug, not just a performance
+    // detail. The next redirect for this short code will simply miss the
+    // cache and re-fetch the fresh row from Postgres.
+    await invalidateCachedUrl(url.short_code);
+
     return res.json({
         ...url,
         shortUrl: `${process.env.BASE_URL}/${url.short_code}`,
@@ -119,29 +130,58 @@ export async function deleteUrl(req, res) {
     // never delete someone else's url even by guessing/incrementing an id —
     // the WHERE clause is the authorization check, not a separate step.
     const result = await pool.query(
-        `DELETE FROM urls WHERE id = $1 AND user_id = $2 RETURNING id`,
+        `DELETE FROM urls WHERE id = $1 AND user_id = $2 RETURNING id, short_code`,
         [id, req.userId]
     );
 
     if (result.rowCount === 0) {
         return res.status(404).json({ error: "Url not found" });
     }
+
+    // Same reasoning as updateUrl — a deleted url must stop resolving
+    // immediately, not up to 5 minutes later just because a stale cache
+    // entry is still sitting there.
+    await invalidateCachedUrl(result.rows[0].short_code);
+
     return res.status(204).send();
 }
 
 export async function redirectToOriginal(req, res) {
     const { shortCode } = req.params;
 
-    const result = await pool.query(
-        `SELECT id, original_url, is_active, expires_at FROM urls WHERE short_code = $1`,
-        [shortCode]
-    );
+    // Cache-aside: check Redis first. If it's there, we skip Postgres
+    // entirely for this request — that's the whole performance win. If
+    // not (a genuine miss, OR Redis itself being unreachable — getCachedUrl
+    // treats both the same and returns null either way), we fall through
+    // to the exact same Postgres query Stage 1-4 always ran.
+    let url = await getCachedUrl(shortCode);
 
-    if (result.rows.length === 0) {
-        return res.status(404).json({ error: "Short URL not found" });
+    if (url) {
+        // JSON has no concept of a Date type — JSON.stringify turned
+        // expires_at into a plain ISO string when we cached it, and
+        // JSON.parse just gives that string straight back, not a real
+        // Date object. We have to reconstruct it here, or the
+        // `url.expires_at < new Date()` comparison below would silently
+        // compare a string to a Date and never behave correctly.
+        url = { ...url, expires_at: url.expires_at ? new Date(url.expires_at) : null };
+    } else {
+        const result = await pool.query(
+            `SELECT id, original_url, is_active, expires_at FROM urls WHERE short_code = $1`,
+            [shortCode]
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: "Short URL not found" });
+        }
+
+        url = result.rows[0];
+
+        // Cache the row regardless of is_active/expires_at — caching a
+        // disabled or expired url's "no" answer is just as valuable as
+        // caching an active one's "yes," since it means someone repeatedly
+        // hitting a dead link also stops hammering Postgres on every click.
+        await setCachedUrl(shortCode, url);
     }
-
-    const url = result.rows[0];
 
     // 410 Gone (not 404) for both of these on purpose — 404 means "nothing
     // here has ever existed at this address," 410 means "this specifically
