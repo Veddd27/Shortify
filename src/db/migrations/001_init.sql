@@ -1,7 +1,11 @@
--- Stage 1 schema for Shortify.
--- Run manually for now with: psql -U shortify_user -d shortify -f src/db/schema.sql
--- (We're doing this by hand deliberately in Stage 1 — a proper migration tool
--- comes later once we've felt the pain of managing schema changes without one.)
+-- Migration 001: initial schema (Stage 1).
+-- Run manually with: psql -U shortify_user -d shortify -f src/db/migrations/001_init.sql
+--
+-- Starting with migration 002, schema changes stop being hand-edits to one
+-- evolving file and become their own numbered, ordered files instead — each
+-- one describes a single, specific change relative to whatever came before
+-- it. This file is what we already ran to create the original tables;
+-- IF NOT EXISTS makes it safe to re-run on a fresh database without error.
 
 -- ---------------------------------------------------------------------------
 -- users

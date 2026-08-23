@@ -2,39 +2,49 @@ import pool from "../config/db.js";
 import { encode } from "../utils/base62.js";
 
 export async function createUrl(req, res) {
-    // validate(createUrlSchema) already confirmed originalUrl is present
-    // and a well-formed URL before this handler ran.
-    const { originalUrl } = req.body;
+    // validate(createUrlSchema) already confirmed originalUrl is a valid
+    // URL, customAlias (if present) is a safe/well-formed string, and
+    // expiresAt (if present) is a real future ISO datetime.
+    const { originalUrl, customAlias, expiresAt } = req.body;
 
-    // We need the row's id *before* we can compute its short_code (the code
-    // is just base62(id)), but the normal INSERT...RETURNING flow only gives
-    // us the id *after* insert. Instead of inserting once and UPDATEing the
-    // short_code in a second query, we pull the next value straight from the
-    // table's underlying sequence (urls_id_seq — the counter object Postgres
-    // created for us behind BIGSERIAL) and then insert that id explicitly.
-    // BIGSERIAL only sets the *default* for id to nextval(); it doesn't
-    // stop us providing our own value, so this is a normal, safe insert.
+    // We always grab a fresh id from the sequence, even when a customAlias
+    // is supplied and we won't base62-encode it into anything. Two reasons:
+    // every row still needs an id as its primary key regardless, and always
+    // taking this same path (rather than branching into two different
+    // INSERT statements) keeps the query below the same no matter which
+    // case we're in.
     const seqResult = await pool.query("SELECT nextval('urls_id_seq') AS id");
     const id = seqResult.rows[0].id;
-    const shortCode = encode(id);
+    const shortCode = customAlias || encode(id);
 
-    const result = await pool.query(
-        `INSERT INTO urls (id, short_code, original_url, user_id)
-         VALUES ($1, $2, $3, $4)
-         RETURNING id, short_code, original_url, created_at`,
-        [id, shortCode, originalUrl, req.userId]
-    );
+    try {
+        const result = await pool.query(
+            `INSERT INTO urls (id, short_code, original_url, user_id, expires_at)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING id, short_code, original_url, is_active, expires_at, created_at`,
+            [id, shortCode, originalUrl, req.userId, expiresAt || null]
+        );
 
-    const url = result.rows[0];
-    return res.status(201).json({
-        ...url,
-        shortUrl: `${process.env.BASE_URL}/${url.short_code}`,
-    });
+        const url = result.rows[0];
+        return res.status(201).json({
+            ...url,
+            shortUrl: `${process.env.BASE_URL}/${url.short_code}`,
+        });
+    } catch (err) {
+        // Same unique_violation handling as register() in auth.controller.js
+        // — short_code has a UNIQUE constraint, and a customAlias could
+        // collide with either another user's custom alias or (rarely) an
+        // auto-generated one.
+        if (err.code === "23505") {
+            return res.status(409).json({ error: "That short code is already taken" });
+        }
+        throw err;
+    }
 }
 
 export async function listUrls(req, res) {
     const result = await pool.query(
-        `SELECT id, short_code, original_url, created_at
+        `SELECT id, short_code, original_url, is_active, expires_at, created_at
          FROM urls
          WHERE user_id = $1
          ORDER BY created_at DESC`,
@@ -46,6 +56,59 @@ export async function listUrls(req, res) {
         shortUrl: `${process.env.BASE_URL}/${url.short_code}`,
     }));
     return res.json({ urls });
+}
+
+export async function updateUrl(req, res) {
+    const { id } = req.params;
+    const { originalUrl, isActive, expiresAt } = req.body;
+
+    // We build the SET clause piece by piece, only including the fields
+    // that were actually sent — validate(updateUrlSchema) already
+    // guaranteed at least one of them is present. The column *names*
+    // here are always our own hardcoded strings, never taken from user
+    // input; only the *values* going into $1, $2, ... come from the
+    // request, and those stay parameterized exactly like every other
+    // query in this file. That distinction is what keeps this safe from
+    // injection despite the query text being built dynamically.
+    const setClauses = [];
+    const values = [];
+
+    if (originalUrl !== undefined) {
+        values.push(originalUrl);
+        setClauses.push(`original_url = $${values.length}`);
+    }
+    if (isActive !== undefined) {
+        values.push(isActive);
+        setClauses.push(`is_active = $${values.length}`);
+    }
+    if (expiresAt !== undefined) {
+        // expiresAt can legitimately be null here (Zod's .nullable() on
+        // updateUrlSchema) — that's the client explicitly asking to clear
+        // an existing expiration.
+        values.push(expiresAt);
+        setClauses.push(`expires_at = $${values.length}`);
+    }
+
+    values.push(id, req.userId);
+    const idPlaceholder = `$${values.length - 1}`;
+    const userIdPlaceholder = `$${values.length}`;
+
+    const result = await pool.query(
+        `UPDATE urls SET ${setClauses.join(", ")}
+         WHERE id = ${idPlaceholder} AND user_id = ${userIdPlaceholder}
+         RETURNING id, short_code, original_url, is_active, expires_at, created_at`,
+        values
+    );
+
+    if (result.rowCount === 0) {
+        return res.status(404).json({ error: "Url not found" });
+    }
+
+    const url = result.rows[0];
+    return res.json({
+        ...url,
+        shortUrl: `${process.env.BASE_URL}/${url.short_code}`,
+    });
 }
 
 export async function deleteUrl(req, res) {
@@ -69,7 +132,7 @@ export async function redirectToOriginal(req, res) {
     const { shortCode } = req.params;
 
     const result = await pool.query(
-        `SELECT original_url FROM urls WHERE short_code = $1`,
+        `SELECT original_url, is_active, expires_at FROM urls WHERE short_code = $1`,
         [shortCode]
     );
 
@@ -77,9 +140,23 @@ export async function redirectToOriginal(req, res) {
         return res.status(404).json({ error: "Short URL not found" });
     }
 
+    const url = result.rows[0];
+
+    // 410 Gone (not 404) for both of these on purpose — 404 means "nothing
+    // here has ever existed at this address," 410 means "this specifically
+    // existed and is now intentionally unavailable." A disabled or expired
+    // link is the second case, and telling the two apart is genuinely
+    // useful information for whoever's debugging a dead link.
+    if (!url.is_active) {
+        return res.status(410).json({ error: "This short URL has been disabled" });
+    }
+    if (url.expires_at && url.expires_at < new Date()) {
+        return res.status(410).json({ error: "This short URL has expired" });
+    }
+
     // 302 (temporary redirect) rather than 301 (permanent) is deliberate:
     // a permanent redirect tells browsers/CDNs to cache the mapping and
     // stop asking our server at all, which breaks the "measure and improve
     // redirect performance" work planned for Stage 4/5.
-    return res.redirect(302, result.rows[0].original_url);
+    return res.redirect(302, url.original_url);
 }
