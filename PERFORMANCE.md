@@ -84,3 +84,51 @@ The first version of the "graceful fallback if Redis is down" logic wasn't actua
 ## Open item
 
 Revisit this comparison once deployed to AWS with ElastiCache, and/or complete the native Redis (Memurai) install locally to isolate whether Docker Desktop's networking is really the cause.
+
+---
+
+# Stage 7 — Load Testing
+
+**Date:** 2026-08-23
+**Environment caveat, stated up front**: this is still a single laptop running the k6 load generator, the Node app, Postgres, and the Redis container all at once, on the same machine, competing for the same CPU cores. Stage 8 (cloud deployment) and Stage 9 (horizontal scaling) haven't happened yet. Every number below is a **single-instance, single-machine ceiling**, not a production capacity claim — and as the findings below show, the load generator sharing the machine with the server under test is itself part of the story.
+
+## Part 1 — does rate limiting actually hold under real load?
+
+Ran the existing Stage 4/5 script ([`redirect-test.js`](load-test/redirect-test.js), ramping to 200 VUs) with Stage 6's rate limiter left **on** (default, 100 req/min per IP on the redirect endpoint).
+
+**Result: 200 successful redirects out of 59,417 total requests (99.66% correctly rejected with 429).** Since k6 sends all virtual users' traffic from one local IP, this is exactly the expected outcome: ~100 requests per 60-second window got through, everything else was correctly throttled. This is a genuine validation of Stage 6 under real concurrent load, not just the small controlled curl tests from that stage — the limiter holds up.
+
+## Part 2 — finding the actual capacity ceiling
+
+Rate limiting was temporarily disabled (`DISABLE_RATE_LIMIT=true` — added specifically for this test, same pattern as `DISABLE_CLICK_TRACKING`) so the test could reach real system limits instead of our own intentional throttling. A new script, [`stress-test.js`](load-test/stress-test.js), removes the `sleep(0.1)` pacing Stage 4/5 used (that pacing was deliberate for clean latency comparisons; here we want raw throughput) and ramps virtual users to 1,500.
+
+| | Run 1 | Run 2 (repeat, with diagnostics running alongside) |
+|---|---|---|
+| Peak throughput | 2,359 req/s | 2,220 req/s |
+| Error rate | **0%** (0 / 283,128) | **0%** (0 / 266,462) |
+| p95 latency at peak | 598.8 ms | 688.8 ms |
+| avg latency at peak | 286.7 ms | 305.0 ms |
+
+The system never broke — every single request across both runs got a correct `302`. What it did do is get significantly slower under sustained heavy concurrency (sub-6ms p95 at moderate load in Stage 4/5, ~600-700ms p95 here) — a real, honest degradation curve rather than a hard failure.
+
+## Where's the actual bottleneck? (checked, not assumed)
+
+Sampled mid-run:
+- **Postgres connections**: 2 active, 9 idle out of 11 total — the connection pool (`max: 10`) was **not** saturated or queuing.
+- **Redis container CPU**: 15.82% — nowhere near its limit.
+- **Node process CPU**: measured at **~109%** — essentially one full CPU core maxed out.
+
+That's the real finding: **the bottleneck is Node's single-threaded JavaScript execution, not the database or the cache.** Every request still does real synchronous work — parsing the `User-Agent` string (regex-based, in `parseUserAgent`), JSON-encoding/decoding the cached url, building the click insert — and all of that competes for the same one thread, regardless of how many free database connections or how much Redis headroom exists. This is a specific, concrete, and encouraging piece of evidence for why Stage 9 (horizontal scaling — running multiple Node processes/instances) is the right next lever to pull, rather than, say, further tuning the database.
+
+**One more honest caveat**: the k6 load generator itself ran on this same laptop, competing for the same CPU the server needed. A properly isolated test (separate load-generator machine, standard practice, and something we'll have naturally once deployed) would very likely show a *higher* real ceiling than measured here — this number is a lower bound, not a precise one.
+
+## Reproducing this
+
+```bash
+# Part 1 (rate limiting on, default):
+node load-test/setup.js
+k6 run -e SHORT_CODE=<code> load-test/redirect-test.js
+
+# Part 2 (finding the ceiling): set DISABLE_RATE_LIMIT=true in .env, restart the server, then:
+k6 run -e SHORT_CODE=<code> load-test/stress-test.js
+```

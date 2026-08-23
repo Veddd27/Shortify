@@ -14,6 +14,17 @@ import redis from "../config/redis.js";
 //                   (an IP address, or a logged-in user's id)
 export function rateLimit({ windowSeconds, max, keyPrefix, keyGenerator }) {
     return async (req, res, next) => {
+        // DISABLE_RATE_LIMIT exists specifically for Stage 7 load testing:
+        // a k6 run from one machine sends every virtual user's traffic
+        // from the same IP, which would all collapse onto ONE counter key
+        // and get throttled almost immediately — masking the system's
+        // real capacity behind our own intentional protection. Flip this
+        // on only to measure raw capacity; normal operation always has it
+        // off.
+        if (process.env.DISABLE_RATE_LIMIT === "true") {
+            return next();
+        }
+
         const key = `ratelimit:${keyPrefix}:${keyGenerator(req)}`;
 
         let count;
