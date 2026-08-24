@@ -1,0 +1,8 @@
+node_modules
+npm-debug.log
+.env
+.git
+.gitignore
+*.pem
+load-test
+PERFORMANCE.md

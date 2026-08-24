@@ -1,0 +1,89 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      # These three env vars are the official Postgres image's own
+      # bootstrap mechanism — on first startup (empty data volume) it
+      # creates exactly this role, password, and database automatically.
+      # We don't need a separate "create role" step like we did locally.
+      POSTGRES_USER: shortify_user
+      POSTGRES_PASSWORD: ${PGPASSWORD}
+      POSTGRES_DB: shortify
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Same official image also runs any *.sql files it finds in
+      # /docker-entrypoint-initdb.d, in alphabetical order, but ONLY on
+      # that first startup. Our migration files are already named
+      # 001_/002_/003_, so mounting the folder here means the schema gets
+      # built automatically — no manual psql step needed for a fresh setup.
+      - ./src/db/migrations:/docker-entrypoint-initdb.d:ro
+    # Host port 5433 (not 5432) deliberately — lets this run alongside
+    # the native Postgres service without a port conflict, rather than
+    # forcing you to stop one to use the other.
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shortify_user -d shortify"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    command: ["node", "src/server.js"]
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      # postgres/redis here are the other services' NAMES, not localhost —
+      # docker-compose creates its own private network where every service
+      # can reach every other one by name. This is the actual reason
+      # containerizing the whole stack simplifies things: no more "is
+      # Postgres running as a Windows service, is the Redis container up,
+      # do the ports line up" — compose handles all of that internally.
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: shortify
+      PGUSER: shortify_user
+      PGPASSWORD: ${PGPASSWORD}
+      BASE_URL: http://localhost:3000
+      JWT_SECRET: ${JWT_SECRET}
+      DISABLE_CLICK_TRACKING: "false"
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      DISABLE_RATE_LIMIT: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: ["node", "src/worker.js"]
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: shortify
+      PGUSER: shortify_user
+      PGPASSWORD: ${PGPASSWORD}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
