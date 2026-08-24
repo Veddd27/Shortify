@@ -170,3 +170,43 @@ npm run worker   # the click-tracking worker, in a separate terminal
 node load-test/setup.js
 k6 run -e SHORT_CODE=<code> load-test/redirect-test.js
 ```
+
+---
+
+# Stage 7 addendum — pushing to 5,000 concurrent users
+
+**Date:** 2026-08-24
+**Why:** curiosity about what happens well past the ~1,500 VU ceiling that found the single-CPU-core bottleneck. Ran [`extreme-stress-test.js`](load-test/extreme-stress-test.js), ramping to **5,000** concurrent VUs (machine: 12-core/16-thread laptop — plenty of spare cores, since the app only ever uses one).
+
+## The prediction, and where it was wrong
+
+Going in, the expectation (stated to the user beforehand) was: throughput won't improve past ~2,300 req/s since the single core is already saturated — pushing more concurrency should just make latency worse, not raise the ceiling. **That was only half right.**
+
+| | Stage 7 (1,500 VUs) | This test (5,000 VUs) |
+|---|---|---|
+| Throughput | 2,359 req/s | **3,828 req/s (+62%)** |
+| p95 latency | 598.8 ms | **1.3 s (+117%)** |
+| Error rate | 0% | **0%** |
+
+The redirect path never actually failed — 100% success across nearly 500,000 requests, even at 5,000 concurrent users. But throughput went *up*, not flat, which the "single core is maxed" framing alone doesn't fully explain. The likely reason: with more requests permanently in flight, the one CPU-bound process spends less time idle between requests, squeezing out somewhat higher aggregate throughput — at the direct cost of each individual request queueing far longer before its turn. Same underlying bottleneck (one core), viewed from the throughput side instead of the latency side.
+
+## The real limitation this surfaced: the async worker falls behind under sustained extreme load
+
+This is the more important finding, and it would have been easy to miss by only looking at the "0% errors!" headline. Checking the click-tracking queue immediately after the test:
+
+- **390,320 jobs still sitting unprocessed** in the queue, out of ~497,617 total clicks generated.
+- Confirmed it was actively draining, not stuck (`LLEN` dropped from 371,410 to 367,216 over 5 seconds — roughly 840 jobs/sec).
+- At that drain rate, fully catching up would have taken several more minutes after the load test itself had already finished.
+
+**What this means honestly**: Stage 10's async queue absorbs *bursts* well within its processing capacity (the Stage 4-comparable test — ~60,000 requests over 80s — drained within seconds of the test ending). But at *sustained* throughput that exceeds the single worker's processing rate (~840/sec observed here, versus ~3,800 req/s of incoming redirects), the backlog grows for as long as the overload continues, and analytics data becomes meaningfully stale — minutes behind, not seconds. The redirect experience stays perfect; the analytics pipeline does not.
+
+**The concrete next step this points to**: the worker currently runs with default concurrency (one job at a time). Running multiple worker processes, or configuring higher per-worker concurrency, would let the consumer side scale independently of the producer side — exactly the kind of targeted fix that's only obvious *because* this was pushed hard enough to find it, rather than stopping at the "0% errors" headline.
+
+## Reproducing this
+
+```bash
+node load-test/setup.js
+# set DISABLE_RATE_LIMIT=true in .env, restart the server + worker, then:
+k6 run -e SHORT_CODE=<code> load-test/extreme-stress-test.js
+# check queue backlog afterward with: redis-cli LLEN bull:click-tracking:wait
+```
